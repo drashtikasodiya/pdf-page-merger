@@ -243,7 +243,64 @@ const downloadLink = document.getElementById('downloadLink');
 const diagram = document.getElementById('diagram');
 
 let currentFile = null;
+let logEntries = []; // {msg, cls} — kept in sync with IndexedDB so a refresh can restore it
 
+// ---------- persistence (IndexedDB) ----------
+// Everything below just remembers your file, settings, log, and last result
+// across a page refresh. Nothing is sent anywhere — it stays in your browser.
+const DB_NAME = 'pageSplicerDB';
+const STORE = 'state';
+
+function idbOpen(){
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function idbSet(key, value){
+  try{
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).put(value, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }catch(e){ console.warn('idbSet failed', e); }
+}
+async function idbGet(key){
+  try{
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readonly');
+      const req = tx.objectStore(STORE).get(key);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }catch(e){ console.warn('idbGet failed', e); return undefined; }
+}
+async function idbDelete(key){
+  try{
+    const db = await idbOpen();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE, 'readwrite');
+      tx.objectStore(STORE).delete(key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  }catch(e){ console.warn('idbDelete failed', e); }
+}
+
+function saveSettings(){
+  idbSet('settings', {
+    numParts: numPartsInput.value,
+    removeBlanks: removeBlanksInput.checked
+  });
+}
+
+// ---------- UI ----------
 function renderDiagram(){
   const n = Math.max(2, Math.min(10, parseInt(numPartsInput.value) || 2));
   let html = '';
@@ -254,10 +311,11 @@ function renderDiagram(){
   html += `<span class="arrow">→</span><div class="result">1 wide page</div>`;
   diagram.innerHTML = html;
 }
-numPartsInput.addEventListener('input', renderDiagram);
+numPartsInput.addEventListener('input', () => { renderDiagram(); saveSettings(); });
+removeBlanksInput.addEventListener('change', saveSettings);
 renderDiagram();
 
-function setFile(file){
+async function setFile(file, opts = {}){
   if(!file || file.type !== 'application/pdf'){
     log('Please choose a .pdf file.', 'err');
     return;
@@ -266,9 +324,15 @@ function setFile(file){
   fileNameEl.textContent = file.name;
   filebar.style.display = 'flex';
   goBtn.disabled = false;
-  resultBar.style.display = 'none';
-  logEl.style.display = 'none';
-  logEl.innerHTML = '';
+
+  if(!opts.restoring){
+    resultBar.style.display = 'none';
+    clearLog();
+    idbDelete('result');
+    // Persist the file bytes so it survives a refresh
+    const buffer = await file.arrayBuffer();
+    idbSet('file', { name: file.name, buffer });
+  }
 }
 
 drop.addEventListener('click', () => fileInput.click());
@@ -281,7 +345,18 @@ clearFileBtn.addEventListener('click', () => {
   fileInput.value = '';
   filebar.style.display = 'none';
   goBtn.disabled = true;
+  resultBar.style.display = 'none';
+  clearLog();
+  idbDelete('file');
+  idbDelete('result');
 });
+
+function clearLog(){
+  logEntries = [];
+  logEl.style.display = 'none';
+  logEl.innerHTML = '';
+  idbDelete('log');
+}
 
 function log(msg, cls){
   logEl.style.display = 'block';
@@ -290,6 +365,9 @@ function log(msg, cls){
   line.textContent = msg;
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
+
+  logEntries.push({ msg, cls });
+  idbSet('log', logEntries);
 }
 
 async function isPageBlank(pdfjsDoc, pageIndex){
@@ -315,8 +393,8 @@ goBtn.addEventListener('click', async () => {
   if(!currentFile) return;
   goBtn.disabled = true;
   resultBar.style.display = 'none';
-  logEl.style.display = 'block';
-  logEl.innerHTML = '';
+  idbDelete('result');
+  clearLog();
 
   try{
     const numParts = Math.max(2, Math.min(10, parseInt(numPartsInput.value) || 2));
@@ -386,11 +464,16 @@ goBtn.addEventListener('click', async () => {
     const url = URL.createObjectURL(blob);
 
     const baseName = currentFile.name.replace(/\.pdf$/i, '');
+    const downloadName = `${baseName}_merged.pdf`;
+    const doneMsg = `Done — ${partSize} merged page(s) ready.`;
+
     downloadLink.href = url;
-    downloadLink.download = `${baseName}_merged.pdf`;
-    resultMsg.textContent = `Done — ${partSize} merged page(s) ready.`;
+    downloadLink.download = downloadName;
+    resultMsg.textContent = doneMsg;
     resultBar.style.display = 'flex';
     log('Complete.', 'ok');
+
+    idbSet('result', { buffer: outBytes.buffer.slice(0), filename: downloadName, msg: doneMsg });
 
   } catch(err){
     log('Error: ' + err.message, 'err');
@@ -399,6 +482,51 @@ goBtn.addEventListener('click', async () => {
     goBtn.disabled = false;
   }
 });
+
+// ---------- restore state on page load ----------
+(async function init(){
+  try{
+    const settings = await idbGet('settings');
+    if(settings){
+      if(settings.numParts) numPartsInput.value = settings.numParts;
+      if(typeof settings.removeBlanks === 'boolean') removeBlanksInput.checked = settings.removeBlanks;
+      renderDiagram();
+    }
+
+    const savedLog = await idbGet('log');
+    if(savedLog && savedLog.length){
+      logEntries = savedLog;
+      logEl.style.display = 'block';
+      logEl.innerHTML = '';
+      for(const entry of savedLog){
+        const line = document.createElement('div');
+        if(entry.cls) line.className = entry.cls;
+        line.textContent = entry.msg;
+        logEl.appendChild(line);
+      }
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    const savedFile = await idbGet('file');
+    if(savedFile && savedFile.buffer){
+      const blob = new Blob([savedFile.buffer], { type: 'application/pdf' });
+      blob.name = savedFile.name;
+      await setFile(blob, { restoring: true });
+    }
+
+    const savedResult = await idbGet('result');
+    if(savedResult && savedResult.buffer){
+      const blob = new Blob([savedResult.buffer], { type: 'application/pdf' });
+      const url = URL.createObjectURL(blob);
+      downloadLink.href = url;
+      downloadLink.download = savedResult.filename;
+      resultMsg.textContent = savedResult.msg;
+      resultBar.style.display = 'flex';
+    }
+  }catch(e){
+    console.warn('Could not restore previous session', e);
+  }
+})();
 </script>
 </body>
 </html>
